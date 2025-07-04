@@ -149,8 +149,10 @@ def planner_node(
     if configurable.enable_deep_thinking:
         llm = get_llm_by_type("reasoning")
     elif AGENT_LLM_MAP["planner"] == "basic":
+        # Выбираем правильную модель данных в зависимости от режима
+        schema_class = UnifiedResearchPlan if use_multi_agent else Plan
         llm = get_llm_by_type("basic").with_structured_output(
-            Plan,
+            schema_class,
             method="json_mode",
         )
     else:
@@ -380,9 +382,13 @@ def coordinator_node(
             logger.error(f"Error processing tool calls: {e}")
     else:
         logger.warning(
-            "Coordinator response contains no tool calls. Terminating workflow execution."
+            "🚨 КООРДИНАТОР НЕ ВЫЗВАЛ handoff_to_planner!"
         )
-        logger.debug(f"Coordinator response: {response}")
+        logger.warning(f"📝 Полный ответ координатора: {response.content if hasattr(response, 'content') else str(response)}")
+        logger.warning(f"🔧 Тип ответа: {type(response)}")
+        if hasattr(response, 'tool_calls'):
+            logger.warning(f"🛠️ Tool calls: {response.tool_calls}")
+        logger.warning("❌ Завершаем выполнение рабочего процесса")
 
     return Command(
         update={

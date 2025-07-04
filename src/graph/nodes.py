@@ -25,6 +25,7 @@ from src.config.agents import AGENT_LLM_MAP
 from src.config.configuration import Configuration
 from src.llms.llm import get_llm_by_type
 from src.prompts.planner_model import Plan
+from src.prompts.multi_agent_planner_model import UnifiedResearchPlan, PlanningMode
 from src.prompts.template import apply_prompt_template
 from src.utils.json_utils import repair_json_output
 
@@ -32,6 +33,42 @@ from .types import State
 from ..config import SELECTED_SEARCH_ENGINE, SearchEngine
 
 logger = logging.getLogger(__name__)
+
+
+def _should_use_multi_agent_planning(query: str) -> bool:
+    """
+    Определяет, нужно ли использовать многоагентное планирование
+    на основе сложности и характера запроса
+    """
+    complexity_indicators = [
+        "analyze", "compare", "comprehensive", "detailed", "market", "industry",
+        "анализ", "сравни", "всесторонний", "детальный", "рынок", "отрасль",
+        "research", "investigate", "study", "evaluation", "assessment",
+        "исследование", "изучение", "оценка", "влияние", "тенденции"
+    ]
+    
+    breadth_indicators = [
+        "impact", "trends", "future", "current state", "stakeholders",
+        "влияние", "тенденции", "будущее", "текущее состояние", "участники",
+        "ecosystem", "landscape", "overview", "multiple", "various",
+        "экосистема", "ландшафт", "обзор", "множественный", "различные"
+    ]
+    
+    # Проверяем индикаторы сложности
+    has_complexity = any(indicator in query.lower() for indicator in complexity_indicators)
+    has_breadth = any(indicator in query.lower() for indicator in breadth_indicators)
+    
+    # Также учитываем длину запроса (более длинные запросы часто сложнее)
+    is_long_query = len(query.split()) > 8
+    
+    result = has_complexity and (has_breadth or is_long_query)
+    
+    # Добавляем подробное логирование
+    logger.info(f"🔍 АНАЛИЗ ЗАПРОСА: '{query[:100]}...'")
+    logger.info(f"📊 Сложность: {has_complexity} | Широта: {has_breadth} | Длинный: {is_long_query}")
+    logger.info(f"🤖 МНОГОАГЕНТНЫЙ РЕЖИМ: {'✅ ДА' if result else '❌ НЕТ'}")
+    
+    return result
 
 
 @tool
@@ -85,21 +122,29 @@ def planner_node(
     logger.info("Planner generating full plan")
     configurable = Configuration.from_runnable_config(config)
     plan_iterations = state["plan_iterations"] if state.get("plan_iterations", 0) else 0
-    messages = apply_prompt_template("planner", state, configurable)
+    
+    # Determine if we should use multi-agent planning
+    query = state.get("research_topic", "").lower()
+    use_multi_agent = _should_use_multi_agent_planning(query)
+    
+    template_name = "multi_agent_planner" if use_multi_agent else "planner"
+    messages = apply_prompt_template(template_name, state, configurable)
 
     if state.get("enable_background_investigation") and state.get(
         "background_investigation_results"
     ):
-        messages += [
-            {
-                "role": "user",
-                "content": (
-                    "background investigation results of user query:\n"
-                    + state["background_investigation_results"]
-                    + "\n"
-                ),
-            }
-        ]
+        bg_results = state.get("background_investigation_results", "")
+        if bg_results:
+            messages += [
+                {
+                    "role": "user",
+                    "content": (
+                        "background investigation results of user query:\n"
+                        + bg_results
+                        + "\n"
+                    ),
+                }
+            ]
 
     if configurable.enable_deep_thinking:
         llm = get_llm_by_type("reasoning")
@@ -118,13 +163,31 @@ def planner_node(
     full_response = ""
     if AGENT_LLM_MAP["planner"] == "basic" and not configurable.enable_deep_thinking:
         response = llm.invoke(messages)
-        full_response = response.model_dump_json(indent=4, exclude_none=True)
+        # Извлекаем JSON из content поля (исправление для многоагентных планов)
+        if hasattr(response, 'content'):
+            content = response.content
+            # Убираем markdown блоки если есть
+            import re
+            json_match = re.search(r'```json\s*\n(.*?)\n```', content, re.DOTALL)
+            if json_match:
+                full_response = json_match.group(1)
+                logger.info("🔧 JSON извлечен из markdown блока")
+            else:
+                # Ищем JSON напрямую
+                json_match = re.search(r'\{.*\}', content, re.DOTALL)
+                if json_match:
+                    full_response = json_match.group(0)
+                    logger.info("🔧 JSON найден напрямую в content")
+                else:
+                    full_response = content
+        else:
+            full_response = response.model_dump_json(indent=4, exclude_none=True)
     else:
         response = llm.stream(messages)
         for chunk in response:
             full_response += chunk.content
     logger.debug(f"Current state messages: {state['messages']}")
-    logger.info(f"Planner response: {full_response}")
+    logger.info(f"Planner response: {full_response[:500]}...")
 
     try:
         curr_plan = json.loads(repair_json_output(full_response))
@@ -134,20 +197,63 @@ def planner_node(
             return Command(goto="reporter")
         else:
             return Command(goto="__end__")
+    
+    # Handle multi-agent planning response
+    if curr_plan.get("planning_mode") == "parallel_multi_agent":
+        logger.info("Multi-agent parallel plan generated.")
+        new_plan = UnifiedResearchPlan.model_validate(curr_plan)
+        return Command(
+            update={
+                "messages": [AIMessage(content=full_response, name="planner")],
+                "current_plan": new_plan,
+                "use_multi_agent": True,
+                "research_mode": "parallel",
+            },
+            goto="research_team",  # Will route to parallel_research via continue_to_running_research_team
+        )
+    
+    # Handle sequential planning response (both new and legacy)
+    if curr_plan.get("planning_mode") == "sequential_steps":
+        logger.info("Sequential steps plan generated.")
+        new_plan = UnifiedResearchPlan.model_validate(curr_plan)
+        if new_plan.has_enough_context:
+            return Command(
+                update={
+                    "messages": [AIMessage(content=full_response, name="planner")],
+                    "current_plan": new_plan,
+                    "research_mode": "sequential",
+                },
+                goto="reporter",
+            )
+        else:
+            return Command(
+                update={
+                    "messages": [AIMessage(content=full_response, name="planner")],
+                    "current_plan": new_plan,
+                    "research_mode": "sequential",
+                },
+                goto="research_team",
+            )
+    
+    # Legacy plan handling
     if curr_plan.get("has_enough_context"):
-        logger.info("Planner response has enough context.")
+        logger.info("Legacy planner response has enough context.")
         new_plan = Plan.model_validate(curr_plan)
         return Command(
             update={
                 "messages": [AIMessage(content=full_response, name="planner")],
                 "current_plan": new_plan,
+                "research_mode": "sequential",
             },
             goto="reporter",
         )
+    
+    # Legacy plan needs execution
     return Command(
         update={
             "messages": [AIMessage(content=full_response, name="planner")],
             "current_plan": full_response,
+            "research_mode": "sequential",
         },
         goto="human_feedback",
     )
@@ -186,23 +292,55 @@ def human_feedback_node(
         plan_iterations += 1
         # parse the plan
         new_plan = json.loads(current_plan)
-        if new_plan["has_enough_context"]:
-            goto = "reporter"
+        
+        # Handle different plan types
+        if new_plan.get("planning_mode") == "parallel_multi_agent":
+            goto = "research_team"  # Will route to parallel_research
+            validated_plan = UnifiedResearchPlan.model_validate(new_plan)
+            return Command(
+                update={
+                    "current_plan": validated_plan,
+                    "plan_iterations": plan_iterations,
+                    "locale": new_plan["locale"],
+                    "use_multi_agent": True,
+                    "research_mode": "parallel",
+                },
+                goto=goto,
+            )
+        elif new_plan.get("planning_mode") == "sequential_steps":
+            validated_plan = UnifiedResearchPlan.model_validate(new_plan)
+            if validated_plan.has_enough_context:
+                goto = "reporter"
+            return Command(
+                update={
+                    "current_plan": validated_plan,
+                    "plan_iterations": plan_iterations,
+                    "locale": new_plan["locale"],
+                    "research_mode": "sequential",
+                },
+                goto=goto,
+            )
+        else:
+            # Legacy plan handling
+            if new_plan.get("has_enough_context"):
+                goto = "reporter"
+            validated_plan = Plan.model_validate(new_plan)
+            return Command(
+                update={
+                    "current_plan": validated_plan,
+                    "plan_iterations": plan_iterations,
+                    "locale": new_plan["locale"],
+                    "research_mode": "sequential",
+                },
+                goto=goto,
+            )
+            
     except json.JSONDecodeError:
         logger.warning("Planner response is not a valid JSON")
         if plan_iterations > 1:  # the plan_iterations is increased before this check
             return Command(goto="reporter")
         else:
             return Command(goto="__end__")
-
-    return Command(
-        update={
-            "current_plan": Plan.model_validate(new_plan),
-            "plan_iterations": plan_iterations,
-            "locale": new_plan["locale"],
-        },
-        goto=goto,
-    )
 
 
 def coordinator_node(

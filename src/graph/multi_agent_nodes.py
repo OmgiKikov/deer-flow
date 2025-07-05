@@ -25,6 +25,7 @@ class SubAgentTask:
     research_focus: str  # "market_analysis", "technical_specs", "competitor_research"
     description: str
     tools: List[Any]
+    agent_type: str = "researcher"  # NEW: тип агента (researcher|coder)
     context_limit: int = 50000  # Отдельный контекст для каждого субагента
 
 
@@ -51,16 +52,23 @@ class MultiAgentCoordinator:
         Создает план параллельного исследования с множественными субагентами
         Аналог системы Anthropic для разложения задач
         """
+        # NEW: Анализируем сложность запроса и адаптируем количество субагентов
+        complexity_score = self._assess_query_complexity(query)
+        optimal_subagents = min(max_subagents, max(2, complexity_score))
+        
+        logger.info(f"🧠 Query complexity score: {complexity_score}/5, using {optimal_subagents} subagents")
+        
         # Анализируем запрос и определяем аспекты для параллельного исследования
-        research_aspects = await self._identify_research_aspects(query)
+        research_aspects = await self._identify_research_aspects(query, optimal_subagents)
         
         tasks = []
-        for i, aspect in enumerate(research_aspects[:max_subagents]):
+        for i, aspect in enumerate(research_aspects[:optimal_subagents]):
             task = SubAgentTask(
                 agent_id=f"subagent_{i}_{aspect['type']}",
                 research_focus=aspect['focus'],
                 description=aspect['description'],
                 tools=self._select_tools_for_aspect(aspect['type']),
+                agent_type=self._get_agent_type_for_aspect(aspect['type']),
                 context_limit=50000
             )
             tasks.append(task)
@@ -126,9 +134,9 @@ class MultiAgentCoordinator:
         # Создаем специализированного агента
         agent = create_agent(
             agent_name=task.agent_id,
-            agent_type="researcher", 
+            agent_type=task.agent_type,
             tools=task.tools,
-            prompt_template="researcher"
+            prompt_template=task.agent_type
         )
         
         try:
@@ -164,13 +172,56 @@ class MultiAgentCoordinator:
                 sources=[]
             )
     
-    async def _identify_research_aspects(self, query: str) -> List[Dict[str, str]]:
+    def _assess_query_complexity(self, query: str) -> int:
+        """
+        Оценивает сложность запроса и возвращает оптимальное количество субагентов (2-5)
+        """
+        complexity_indicators = [
+            "analyze", "compare", "comprehensive", "detailed", "market", "industry",
+            "анализ", "сравни", "всесторонний", "детальный", "рынок", "отрасль",
+            "research", "investigate", "study", "evaluation", "assessment",
+            "исследование", "изучение", "оценка", "влияние", "тенденции"
+        ]
+        
+        breadth_indicators = [
+            "impact", "trends", "future", "current state", "stakeholders",
+            "влияние", "тенденции", "будущее", "текущее состояние", "участники",
+            "ecosystem", "landscape", "overview", "multiple", "various",
+            "экосистема", "ландшафт", "обзор", "множественный", "различные"
+        ]
+        
+        technical_indicators = [
+            "technical", "architecture", "implementation", "code", "system",
+            "технический", "архитектура", "реализация", "код", "система"
+        ]
+        
+        score = 2  # Базовый счет для любого запроса
+        
+        # +1 за сложность
+        if any(indicator in query.lower() for indicator in complexity_indicators):
+            score += 1
+            
+        # +1 за широту охвата
+        if any(indicator in query.lower() for indicator in breadth_indicators):
+            score += 1
+            
+        # +1 за технические аспекты
+        if any(indicator in query.lower() for indicator in technical_indicators):
+            score += 1
+            
+        # +1 за длинные запросы (обычно более сложные)
+        if len(query.split()) > 10:
+            score += 1
+            
+        return min(5, score)  # Максимум 5 субагентов
+
+    async def _identify_research_aspects(self, query: str, num_agents: int) -> List[Dict[str, str]]:
         """
         Анализирует запрос и определяет аспекты для параллельного исследования
-        Улучшенная версия логики планировщика
+        Адаптируется под количество субагентов
         """
-        # Базовые аспекты, которые можно исследовать параллельно
-        base_aspects = [
+        # Полный набор возможных аспектов
+        all_aspects = [
             {
                 "type": "current_state",
                 "focus": "Current State Analysis", 
@@ -187,14 +238,33 @@ class MultiAgentCoordinator:
                 "description": f"Analyze key players, stakeholders, companies and organizations involved in: {query}"
             },
             {
+                "type": "technical_specs",
+                "focus": "Technical Specifications & Architectures",
+                "description": f"Dive deep into technical specifications, architectures or underlying technologies related to: {query}"
+            },
+            {
+                "type": "data_analysis",
+                "focus": "Quantitative & Data Analysis",
+                "description": f"Perform quantitative analysis, statistics and data-driven insights for: {query}"
+            },
+            {
                 "type": "future_trends",
                 "focus": "Future Trends & Implications", 
                 "description": f"Research future outlook, trends, predictions and implications for: {query}"
             }
         ]
         
-        # TODO: Использовать LLM для более умного определения аспектов
-        return base_aspects
+        # Для простых запросов (2 субагента) - основы
+        if num_agents == 2:
+            return [all_aspects[0], all_aspects[5]]  # current_state + future_trends
+            
+        # Для средних запросов (3 субагента) - добавляем контекст
+        elif num_agents == 3:
+            return [all_aspects[0], all_aspects[1], all_aspects[5]]  # + historical_context
+            
+        # Для сложных запросов (4+ субагентов) - полный набор
+        else:
+            return all_aspects[:num_agents]
     
     def _select_tools_for_aspect(self, aspect_type: str) -> List[Any]:
         """Выбирает подходящие инструменты для типа исследования"""
@@ -203,11 +273,17 @@ class MultiAgentCoordinator:
             crawl_tool
         ]
         
-        if aspect_type in ["current_state", "future_trends"]:
+        if aspect_type in ["current_state", "future_trends", "data_analysis", "technical_specs"]:
             # Для анализа данных добавляем Python REPL
             base_tools.append(python_repl_tool)
             
         return base_tools
+    
+    def _get_agent_type_for_aspect(self, aspect_type: str) -> str:
+        """Возвращает тип агента для данного аспекта"""
+        if aspect_type in ["future_trends", "data_analysis", "technical_specs"]:
+            return "coder"
+        return "researcher"
     
     async def _compress_findings(self, raw_content: str, focus_area: str) -> str:
         """
@@ -252,7 +328,7 @@ async def parallel_research_node(state: State, config: RunnableConfig) -> Comman
         logger.warning("No valid research plan found")
         return Command(goto="reporter")
     
-    query = current_plan.title
+    query = str(current_plan.title)
     logger.info(f"🎯 Исследуем: {query}")
     
     # Создаем план параллельного исследования  
@@ -309,7 +385,8 @@ def should_use_parallel_research(state: State) -> bool:
         return False
         
     # Используем параллельность для сложных исследований
-    if hasattr(current_plan, 'steps') and len(current_plan.steps) > 2:
+    steps_attr = getattr(current_plan, 'steps', None)
+    if steps_attr and isinstance(steps_attr, list) and len(steps_attr) > 2:
         return True
         
     # Или если запрос содержит ключевые слова

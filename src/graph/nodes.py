@@ -4,7 +4,10 @@
 import json
 import logging
 import os
+import re
 from typing import Annotated, Literal
+
+import mcp
 
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.runnables import RunnableConfig
@@ -33,42 +36,6 @@ from .types import State
 from ..config import SELECTED_SEARCH_ENGINE, SearchEngine
 
 logger = logging.getLogger(__name__)
-
-
-def _should_use_multi_agent_planning(query: str) -> bool:
-    """
-    Определяет, нужно ли использовать многоагентное планирование
-    на основе сложности и характера запроса
-    """
-    complexity_indicators = [
-        "analyze", "compare", "comprehensive", "detailed", "market", "industry",
-        "анализ", "сравни", "всесторонний", "детальный", "рынок", "отрасль",
-        "research", "investigate", "study", "evaluation", "assessment",
-        "исследование", "изучение", "оценка", "влияние", "тенденции"
-    ]
-    
-    breadth_indicators = [
-        "impact", "trends", "future", "current state", "stakeholders",
-        "влияние", "тенденции", "будущее", "текущее состояние", "участники",
-        "ecosystem", "landscape", "overview", "multiple", "various",
-        "экосистема", "ландшафт", "обзор", "множественный", "различные"
-    ]
-    
-    # Проверяем индикаторы сложности
-    has_complexity = any(indicator in query.lower() for indicator in complexity_indicators)
-    has_breadth = any(indicator in query.lower() for indicator in breadth_indicators)
-    
-    # Также учитываем длину запроса (более длинные запросы часто сложнее)
-    is_long_query = len(query.split()) > 8
-    
-    result = has_complexity and (has_breadth or is_long_query)
-    
-    # Добавляем подробное логирование
-    logger.info(f"🔍 АНАЛИЗ ЗАПРОСА: '{query[:100]}...'")
-    logger.info(f"📊 Сложность: {has_complexity} | Широта: {has_breadth} | Длинный: {is_long_query}")
-    logger.info(f"🤖 МНОГОАГЕНТНЫЙ РЕЖИМ: {'✅ ДА' if result else '❌ НЕТ'}")
-    
-    return result
 
 
 @tool
@@ -117,17 +84,14 @@ def background_investigation_node(state: State, config: RunnableConfig):
 
 def planner_node(
     state: State, config: RunnableConfig
-) -> Command[Literal["human_feedback", "reporter"]]:
+) -> Command[Literal["human_feedback", "reporter", "parallel_research"]]:
     """Planner node that generate the full plan."""
-    logger.info("Planner generating full plan")
+    logger.info("Planner generating research plan")
     configurable = Configuration.from_runnable_config(config)
     plan_iterations = state["plan_iterations"] if state.get("plan_iterations", 0) else 0
     
-    # Determine if we should use multi-agent planning
-    query = state.get("research_topic", "").lower()
-    use_multi_agent = _should_use_multi_agent_planning(query)
-    
-    template_name = "multi_agent_planner" if use_multi_agent else "planner"
+    # NEW: Always use multi-agent planning - it's more flexible
+    template_name = "multi_agent_planner"
     messages = apply_prompt_template(template_name, state, configurable)
 
     if state.get("enable_background_investigation") and state.get(
@@ -149,10 +113,9 @@ def planner_node(
     if configurable.enable_deep_thinking:
         llm = get_llm_by_type("reasoning")
     elif AGENT_LLM_MAP["planner"] == "basic":
-        # Выбираем правильную модель данных в зависимости от режима
-        schema_class = UnifiedResearchPlan if use_multi_agent else Plan
+        # Always use UnifiedResearchPlan schema
         llm = get_llm_by_type("basic").with_structured_output(
-            schema_class,
+            UnifiedResearchPlan,
             method="json_mode",
         )
     else:
@@ -165,21 +128,18 @@ def planner_node(
     full_response = ""
     if AGENT_LLM_MAP["planner"] == "basic" and not configurable.enable_deep_thinking:
         response = llm.invoke(messages)
-        # Извлекаем JSON из content поля (исправление для многоагентных планов)
+        # Extract JSON from content field
         if hasattr(response, 'content'):
             content = response.content
-            # Убираем markdown блоки если есть
-            import re
             json_match = re.search(r'```json\s*\n(.*?)\n```', content, re.DOTALL)
             if json_match:
                 full_response = json_match.group(1)
-                logger.info("🔧 JSON извлечен из markdown блока")
+                logger.info("🔧 JSON extracted from markdown block")
             else:
-                # Ищем JSON напрямую
                 json_match = re.search(r'\{.*\}', content, re.DOTALL)
                 if json_match:
                     full_response = json_match.group(0)
-                    logger.info("🔧 JSON найден напрямую в content")
+                    logger.info("🔧 JSON found directly in content")
                 else:
                     full_response = content
         else:
@@ -188,6 +148,7 @@ def planner_node(
         response = llm.stream(messages)
         for chunk in response:
             full_response += chunk.content
+    
     logger.debug(f"Current state messages: {state['messages']}")
     logger.info(f"Planner response: {full_response[:500]}...")
 
@@ -200,70 +161,36 @@ def planner_node(
         else:
             return Command(goto="__end__")
     
-    # Handle multi-agent planning response
-    if curr_plan.get("planning_mode") == "parallel_multi_agent":
-        logger.info("Multi-agent parallel plan generated.")
-        new_plan = UnifiedResearchPlan.model_validate(curr_plan)
+    # NEW: Simple logic - create plan and go to parallel research
+    logger.info("🚀 Research plan generated - going to parallel research")
+    new_plan = UnifiedResearchPlan.model_validate(curr_plan)
+    
+    # Check if we have enough context to skip research
+    if new_plan.has_enough_context:
+        logger.info("📚 Plan has enough context - going directly to reporter")
         return Command(
             update={
                 "messages": [AIMessage(content=full_response, name="planner")],
                 "current_plan": new_plan,
-                "use_multi_agent": True,
-                "research_mode": "parallel",
-            },
-            goto="research_team",  # Will route to parallel_research via continue_to_running_research_team
-        )
-    
-    # Handle sequential planning response (both new and legacy)
-    if curr_plan.get("planning_mode") == "sequential_steps":
-        logger.info("Sequential steps plan generated.")
-        new_plan = UnifiedResearchPlan.model_validate(curr_plan)
-        if new_plan.has_enough_context:
-            return Command(
-                update={
-                    "messages": [AIMessage(content=full_response, name="planner")],
-                    "current_plan": new_plan,
-                    "research_mode": "sequential",
-                },
-                goto="reporter",
-            )
-        else:
-            return Command(
-                update={
-                    "messages": [AIMessage(content=full_response, name="planner")],
-                    "current_plan": new_plan,
-                    "research_mode": "sequential",
-                },
-                goto="research_team",
-            )
-    
-    # Legacy plan handling
-    if curr_plan.get("has_enough_context"):
-        logger.info("Legacy planner response has enough context.")
-        new_plan = Plan.model_validate(curr_plan)
-        return Command(
-            update={
-                "messages": [AIMessage(content=full_response, name="planner")],
-                "current_plan": new_plan,
-                "research_mode": "sequential",
+                "research_mode": "skip",
             },
             goto="reporter",
         )
     
-    # Legacy plan needs execution
+    # Go to parallel research
     return Command(
         update={
             "messages": [AIMessage(content=full_response, name="planner")],
-            "current_plan": full_response,
-            "research_mode": "sequential",
+            "current_plan": new_plan,
+            "research_mode": "parallel",
         },
-        goto="human_feedback",
+        goto="parallel_research",
     )
 
 
 def human_feedback_node(
     state,
-) -> Command[Literal["planner", "research_team", "reporter", "__end__"]]:
+) -> Command[Literal["planner", "parallel_research", "reporter", "__end__"]]:
     current_plan = state.get("current_plan", "")
     # check if the plan is auto accepted
     auto_accepted_plan = state.get("auto_accepted_plan", False)
@@ -285,61 +212,32 @@ def human_feedback_node(
         else:
             raise TypeError(f"Interrupt value of {feedback} is not supported.")
 
-    # if the plan is accepted, run the following node
+    # NEW: Simple logic - if plan accepted, go to parallel research
     plan_iterations = state["plan_iterations"] if state.get("plan_iterations", 0) else 0
-    goto = "research_team"
     try:
         current_plan = repair_json_output(current_plan)
-        # increment the plan iterations
         plan_iterations += 1
-        # parse the plan
         new_plan = json.loads(current_plan)
         
-        # Handle different plan types
-        if new_plan.get("planning_mode") == "parallel_multi_agent":
-            goto = "research_team"  # Will route to parallel_research
-            validated_plan = UnifiedResearchPlan.model_validate(new_plan)
-            return Command(
-                update={
-                    "current_plan": validated_plan,
-                    "plan_iterations": plan_iterations,
-                    "locale": new_plan["locale"],
-                    "use_multi_agent": True,
-                    "research_mode": "parallel",
-                },
-                goto=goto,
-            )
-        elif new_plan.get("planning_mode") == "sequential_steps":
-            validated_plan = UnifiedResearchPlan.model_validate(new_plan)
-            if validated_plan.has_enough_context:
-                goto = "reporter"
-            return Command(
-                update={
-                    "current_plan": validated_plan,
-                    "plan_iterations": plan_iterations,
-                    "locale": new_plan["locale"],
-                    "research_mode": "sequential",
-                },
-                goto=goto,
-            )
+        validated_plan = UnifiedResearchPlan.model_validate(new_plan)
+        if validated_plan.has_enough_context:
+            goto = "reporter"
         else:
-            # Legacy plan handling
-            if new_plan.get("has_enough_context"):
-                goto = "reporter"
-            validated_plan = Plan.model_validate(new_plan)
-            return Command(
-                update={
-                    "current_plan": validated_plan,
-                    "plan_iterations": plan_iterations,
-                    "locale": new_plan["locale"],
-                    "research_mode": "sequential",
-                },
-                goto=goto,
-            )
+            goto = "parallel_research"
+            
+        return Command(
+            update={
+                "current_plan": validated_plan,
+                "plan_iterations": plan_iterations,
+                "locale": new_plan["locale"],
+                "research_mode": "parallel",
+            },
+            goto=goto,
+        )
             
     except json.JSONDecodeError:
         logger.warning("Planner response is not a valid JSON")
-        if plan_iterations > 1:  # the plan_iterations is increased before this check
+        if plan_iterations > 1:
             return Command(goto="reporter")
         else:
             return Command(goto="__end__")
@@ -437,212 +335,3 @@ def reporter_node(state: State, config: RunnableConfig):
     logger.info(f"reporter response: {response_content}")
 
     return {"final_report": response_content}
-
-
-def research_team_node(state: State):
-    """Research team node that collaborates on tasks."""
-    logger.info("Research team is collaborating on tasks.")
-    pass
-
-
-async def _execute_agent_step(
-    state: State, agent, agent_name: str
-) -> Command[Literal["research_team"]]:
-    """Helper function to execute a step using the specified agent."""
-    current_plan = state.get("current_plan")
-    observations = state.get("observations", [])
-
-    # Find the first unexecuted step
-    current_step = None
-    completed_steps = []
-    for step in current_plan.steps:
-        if not step.execution_res:
-            current_step = step
-            break
-        else:
-            completed_steps.append(step)
-
-    if not current_step:
-        logger.warning("No unexecuted step found")
-        return Command(goto="research_team")
-
-    logger.info(f"Executing step: {current_step.title}, agent: {agent_name}")
-
-    # Format completed steps information
-    completed_steps_info = ""
-    if completed_steps:
-        completed_steps_info = "# Existing Research Findings\n\n"
-        for i, step in enumerate(completed_steps):
-            completed_steps_info += f"## Existing Finding {i + 1}: {step.title}\n\n"
-            completed_steps_info += f"<finding>\n{step.execution_res}\n</finding>\n\n"
-
-    # Prepare the input for the agent with completed steps info
-    agent_input = {
-        "messages": [
-            HumanMessage(
-                content=f"{completed_steps_info}# Current Task\n\n## Title\n\n{current_step.title}\n\n## Description\n\n{current_step.description}\n\n## Locale\n\n{state.get('locale', 'en-US')}"
-            )
-        ]
-    }
-
-    # Add citation reminder for researcher agent
-    if agent_name == "researcher":
-        if state.get("resources"):
-            resources_info = "**The user mentioned the following resource files:**\n\n"
-            for resource in state.get("resources"):
-                resources_info += f"- {resource.title} ({resource.description})\n"
-
-            agent_input["messages"].append(
-                HumanMessage(
-                    content=resources_info
-                    + "\n\n"
-                    + "You MUST use the **local_search_tool** to retrieve the information from the resource files.",
-                )
-            )
-
-        agent_input["messages"].append(
-            HumanMessage(
-                content="IMPORTANT: DO NOT include inline citations in the text. Instead, track all sources and include a References section at the end using link reference format. Include an empty line between each citation for better readability. Use this format for each reference:\n- [Source Title](URL)\n\n- [Another Source](URL)",
-                name="system",
-            )
-        )
-
-    # Invoke the agent
-    default_recursion_limit = 25
-    try:
-        env_value_str = os.getenv("AGENT_RECURSION_LIMIT", str(default_recursion_limit))
-        parsed_limit = int(env_value_str)
-
-        if parsed_limit > 0:
-            recursion_limit = parsed_limit
-            logger.info(f"Recursion limit set to: {recursion_limit}")
-        else:
-            logger.warning(
-                f"AGENT_RECURSION_LIMIT value '{env_value_str}' (parsed as {parsed_limit}) is not positive. "
-                f"Using default value {default_recursion_limit}."
-            )
-            recursion_limit = default_recursion_limit
-    except ValueError:
-        raw_env_value = os.getenv("AGENT_RECURSION_LIMIT")
-        logger.warning(
-            f"Invalid AGENT_RECURSION_LIMIT value: '{raw_env_value}'. "
-            f"Using default value {default_recursion_limit}."
-        )
-        recursion_limit = default_recursion_limit
-
-    logger.info(f"Agent input: {agent_input}")
-    result = await agent.ainvoke(
-        input=agent_input, config={"recursion_limit": recursion_limit}
-    )
-
-    # Process the result
-    response_content = result["messages"][-1].content
-    logger.debug(f"{agent_name.capitalize()} full response: {response_content}")
-
-    # Update the step with the execution result
-    current_step.execution_res = response_content
-    logger.info(f"Step '{current_step.title}' execution completed by {agent_name}")
-
-    return Command(
-        update={
-            "messages": [
-                HumanMessage(
-                    content=response_content,
-                    name=agent_name,
-                )
-            ],
-            "observations": observations + [response_content],
-        },
-        goto="research_team",
-    )
-
-
-async def _setup_and_execute_agent_step(
-    state: State,
-    config: RunnableConfig,
-    agent_type: str,
-    default_tools: list,
-) -> Command[Literal["research_team"]]:
-    """Helper function to set up an agent with appropriate tools and execute a step.
-
-    This function handles the common logic for both researcher_node and coder_node:
-    1. Configures MCP servers and tools based on agent type
-    2. Creates an agent with the appropriate tools or uses the default agent
-    3. Executes the agent on the current step
-
-    Args:
-        state: The current state
-        config: The runnable config
-        agent_type: The type of agent ("researcher" or "coder")
-        default_tools: The default tools to add to the agent
-
-    Returns:
-        Command to update state and go to research_team
-    """
-    configurable = Configuration.from_runnable_config(config)
-    mcp_servers = {}
-    enabled_tools = {}
-
-    # Extract MCP server configuration for this agent type
-    if configurable.mcp_settings:
-        for server_name, server_config in configurable.mcp_settings["servers"].items():
-            if (
-                server_config["enabled_tools"]
-                and agent_type in server_config["add_to_agents"]
-            ):
-                mcp_servers[server_name] = {
-                    k: v
-                    for k, v in server_config.items()
-                    if k in ("transport", "command", "args", "url", "env")
-                }
-                for tool_name in server_config["enabled_tools"]:
-                    enabled_tools[tool_name] = server_name
-
-    # Create and execute agent with MCP tools if available
-    if mcp_servers:
-        async with MultiServerMCPClient(mcp_servers) as client:
-            loaded_tools = default_tools[:]
-            for tool in client.get_tools():
-                if tool.name in enabled_tools:
-                    tool.description = (
-                        f"Powered by '{enabled_tools[tool.name]}'.\n{tool.description}"
-                    )
-                    loaded_tools.append(tool)
-            agent = create_agent(agent_type, agent_type, loaded_tools, agent_type)
-            return await _execute_agent_step(state, agent, agent_type)
-    else:
-        # Use default tools if no MCP servers are configured
-        agent = create_agent(agent_type, agent_type, default_tools, agent_type)
-        return await _execute_agent_step(state, agent, agent_type)
-
-
-async def researcher_node(
-    state: State, config: RunnableConfig
-) -> Command[Literal["research_team"]]:
-    """Researcher node that do research"""
-    logger.info("Researcher node is researching.")
-    configurable = Configuration.from_runnable_config(config)
-    tools = [get_web_search_tool(configurable.max_search_results), crawl_tool]
-    retriever_tool = get_retriever_tool(state.get("resources", []))
-    if retriever_tool:
-        tools.insert(0, retriever_tool)
-    logger.info(f"Researcher tools: {tools}")
-    return await _setup_and_execute_agent_step(
-        state,
-        config,
-        "researcher",
-        tools,
-    )
-
-
-async def coder_node(
-    state: State, config: RunnableConfig
-) -> Command[Literal["research_team"]]:
-    """Coder node that do code analysis."""
-    logger.info("Coder node is coding.")
-    return await _setup_and_execute_agent_step(
-        state,
-        config,
-        "coder",
-        [python_repl_tool],
-    )
